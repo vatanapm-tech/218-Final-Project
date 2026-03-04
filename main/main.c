@@ -12,36 +12,32 @@
 #include "esp_adc/adc_cali.h"
 #include "freertos/timers.h"
 
-#define PSEAT_PIN         GPIO_NUM_4       // passenger seat button pin 4
-#define ON_BUTTON         GPIO_NUM_2       // ON button pin 2
-#define PBELT_PIN         GPIO_NUM_6       // passenger belt switch pin 6
-#define DBELT_PIN         GPIO_NUM_7       // driver belt switch pin 7
-#define IGNITION_BUTTON   GPIO_NUM_17      // ignition button pin 17
-#define ON_LED            GPIO_NUM_21      // ON LED pin 21
-#define REFILL_LED        GPIO_NUM_4       // refill LED pin 4
-#define ALARM_PIN         GPIO_NUM_12      // alarm pin 12
-#define ADC_ATTEN         ADC_ATTEN_DB_12  // set ADC attenuation
-#define BITWIDTH          ADC_BITWIDTH_12  // set ADC bitwidth
-#define DELAY_MS          250              // delay in milliseconds
-#define DELAY2_MS         2000             // delay in milliseconds
+// INPUT & OUTPUT variables
+#define ON_LED               GPIO_NUM_21      // On LED pin 21
+#define REFILL_LED           GPIO_NUM_4       // Refill LED pin 4
+#define SELECT_BUTTON        GPIO_NUM_6       // selection button pin 6
+#define REFILL_BUTTON        GPIO_NUM_5       // Refill button pin 5
+#define ON_BUTTON            GPIO_NUM_2       // On button pin 2
+#define MSG_DELAY            2000             // Time delay for display message
 
-//LEDC config variables (servo motor)
+// POTENTIOMETER config variables
+#define PORTION_SEL ADC_CHANNEL_0
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define BITWIDTH ADC_BITWIDTH_12
+#define DELAY_MS 25
+
+// SERVO MOTOR config variables
 #define LEDC_TIMER              LEDC_TIMER_0
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
 #define LEDC_OUTPUT_IO          (7)
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
-//PWM signal frequency required by servo motor
 #define LEDC_FREQUENCY          (50) // Frequency in Hertz. 50 Hz for a 20ms period.
-//minimum and maximum servo pulse widths
-#define LEDC_DUTY_MIN           (240) // Set duty to 2.7% (0 deg angle position)
-#define LEDC_DUTY_MAX           (590) // Set duty to 7.2% to achieve an angle of 90% (max)
-//servo motor step sizes to change how fast the servo motor rotates
+#define LEDC_DUTY_MIN           (240) // Set duty to 2.7% (0 deg angle position) (min pulse width)
+#define LEDC_DUTY_MAX           (590) // Set duty to 7.2% to achieve an angle of 90% (max pulse width)
+        // step sizes to change how fast the servo motor rotates
 #define STEP_HIGH_SPEED      (12.2) // fast speed -- 90 deg in 0.6 sec
 #define STEP_LOW_SPEED       (4.92) // slow speed -- 90 deg in 1.5 sec
-
-//ADC config vars (potentiometer)
-#define MODE_SELECTOR           ADC_CHANNEL_6 //MUST BE ADC CHANNEL
 
 // Keypad variables
 #define LOOP_DELAY_MS           10      // Loop sampling time (ms)
@@ -50,9 +46,10 @@
 #define NCOLS                   4       // Number of keypad columns
 #define ACTIVE                  0       // Keypad active state (0 = low, 1 = high)
 #define NOPRESS                 '\0'    // NOPRESS character
+
 // Initialize keypad rows, columns, layout
-int row_pins[] = {GPIO_NUM_3, GPIO_NUM_8, GPIO_NUM_18, GPIO_NUM_17};     // Pin numbers for rows
-int col_pins[] = {GPIO_NUM_16, GPIO_NUM_15, GPIO_NUM_7, GPIO_NUM_6};   // Pin numbers for columns
+int row_pins[] = {GPIO_NUM_14, GPIO_NUM_13, GPIO_NUM_12, GPIO_NUM_11};     // Pin numbers for rows
+int col_pins[] = {GPIO_NUM_10, GPIO_NUM_9, GPIO_NUM_46, GPIO_NUM_3};   // Pin numbers for columns
 char keypad_array[NROWS][NCOLS] = {   // Keypad layout
     {'1', '2', '3', 'A'},
     {'4', '5', '6', 'B'},
@@ -61,35 +58,50 @@ char keypad_array[NROWS][NCOLS] = {   // Keypad layout
 };
 
 // Global state variables
-bool dseat = false;     
-bool pseat = false;     
-bool dbelt = false;     
-bool pbelt = false;     
-bool ignition = false;  
-bool engine_running = false;
-bool last_ignition_button = false;
+bool turn_on = false;
+bool select_portion = false;
+bool refill = false;
 int executed = 0;
-int ready_led = 0;
-int ignition_off = 0;
-int error = 0;
+int on_led = 0;
+// bool dseat = false;     
+// bool pseat = false;     
+// bool dbelt = false;     
+// bool pbelt = false;     
+// bool ignition = false;  
+// bool engine_running = false;
+// bool last_ignition_button = false;
+// int executed = 0;
+// int ready_led = 0;
+// int ignition_off = 0;
+// int error = 0;
 
 // Wiper system globals
-int OFF = 1024;
-int INT = 2048;
-int LOW = 3072;
-bool off_selected = false;
-bool int_selected = false;
-bool low_selected = false;
-bool high_selected = false;
-int timeDelaySel1 = 1365;
-int timeDelaySel2 = 2730;
+// int OFF = 1024;
+// int INT = 2048;
+// int LOW = 3072;
+// bool off_selected = false;
+// bool int_selected = false;
+// bool low_selected = false;
+// bool high_selected = false;
+// int timeDelaySel1 = 1365;
+// int timeDelaySel2 = 2730;
+bool small_selected = false;
+bool medium_selected = false;
+bool large_selected = false;
 int INTtimeDelay = 1000;
-int mode = 0;           // Current mode: 0=OFF, 1=INT, 2=LOW, 3=HIGH
+int mode = 0;           // Current mode: 0=SMALL, 1=MEDIUM, 2=LARGE
 int state = 0;          // Different wiper states: 0=PARKED, 1=WAIT, 2=UP, 3=DOWN
 int timeInterval = 0;
 float duty = LEDC_DUTY_MIN;
 float current_step = STEP_LOW_SPEED;
 float requested_step = STEP_LOW_SPEED;
+
+int small_portion = 1365;
+int medium_portion = 2730;
+
+bool choose_small = false;
+bool choose_medium = false;
+bool choose_large = false;
 
 // LCD global handling
 hd44780_t lcd_display;
@@ -122,43 +134,40 @@ void lcd_task(void *pvParameters)
         // Clear the display
         hd44780_clear(&lcd_display);
         
-        if (engine_running) {
+        if (turn_on && executed == 0) {
             // Show "Wiper mode:" on first line
             hd44780_gotoxy(&lcd_display, 0, 0);
-            hd44780_puts(&lcd_display, "Wiper mode:");
+            hd44780_puts(&lcd_display, "Smart Pet Feeder");
+            hd44780_gotoxy(&lcd_display, 0, 1);
+            hd44780_puts(&lcd_display, "Activated!");
+        }
             
+        if (executed == 1) {
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            hd44780_puts(&lcd_display, "Portion Size:");
             // Show the current mode on second line
             hd44780_gotoxy(&lcd_display, 0, 1);
             if (mode == 0) {
-                hd44780_puts(&lcd_display, "OFF");
+                hd44780_puts(&lcd_display, "SMALL");
             }
             else if (mode == 1) {
-                // For INT mode, show the delay time too
-                if (INTtimeDelay == 1000) {
-                    hd44780_puts(&lcd_display, "INT-SHORT");
-                }
-                else if (INTtimeDelay == 3000) {
-                    hd44780_puts(&lcd_display, "INT-MEDIUM");
-                }
-                else {
-                    hd44780_puts(&lcd_display, "INT-LONG");
-                }
+                hd44780_puts(&lcd_display, "MEDIUM");
             }
-            else if (mode == 2) {
-                hd44780_puts(&lcd_display, "LOW");
+            else {
+                hd44780_puts(&lcd_display, "LARGE");
             }
-            else if (mode == 3) {
-                hd44780_puts(&lcd_display, "HIGH");
-            }
-        } else {
-            // Engine is off
-            hd44780_gotoxy(&lcd_display, 0, 0);
-            hd44780_puts(&lcd_display, "Engine Off");
         }
-        // Add delay
         vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
-    }
+        }
+        // } else {
+        //     // Engine is off
+        //     hd44780_gotoxy(&lcd_display, 0, 0);
+        //     hd44780_puts(&lcd_display, "System Off");
+        // }
+        // Add delay
+        
 }
+
 
 //Initialize servo motor
 static void ledc_init(void)
@@ -208,7 +217,7 @@ void init_keypad() {
 }
 
 char scan_keypad() {
-    char new_key = NOPRESS;                     //declare variable to hold key that the function returns
+    char new_key = NOPRESS;                     // declare variable to hold key that the function returns
 
     for (int i = 0; i < NROWS; i++) {           // scan each row, setting one row active at a time and then check each column to see if active
         gpio_set_level(row_pins[i], ACTIVE);    // set current row to active state
@@ -226,50 +235,38 @@ char scan_keypad() {
 void app_main(void)
 {
     // Configure GPIO pins
-    // set driver seat pin config to input and internal pullup
+    // set on button config to input and internal pullup
     gpio_reset_pin(ON_BUTTON);
     gpio_set_direction(ON_BUTTON, GPIO_MODE_INPUT);
     gpio_pullup_en(ON_BUTTON);
 
-    // set passenger seat pin config to input and internal pullup
-    gpio_reset_pin(PSEAT_PIN);
-    gpio_set_direction(PSEAT_PIN, GPIO_MODE_INPUT);
-    gpio_pullup_en(PSEAT_PIN);
+    // set refill button config to input and internal pullup
+    gpio_reset_pin(REFILL_BUTTON);
+    gpio_set_direction(REFILL_BUTTON, GPIO_MODE_INPUT);
+    gpio_pullup_en(REFILL_BUTTON);
 
-    // set driver belt pin config to input and internal pullup
-    gpio_reset_pin(DBELT_PIN);
-    gpio_set_direction(DBELT_PIN, GPIO_MODE_INPUT);
-    gpio_pullup_en(DBELT_PIN);
+    // set select button config to input and internal pullup
+    gpio_reset_pin(SELECT_BUTTON);
+    gpio_set_direction(SELECT_BUTTON, GPIO_MODE_INPUT);
+    gpio_pullup_en(SELECT_BUTTON);
 
-    // set passenger belt pin config to input and internal pullup
-    gpio_reset_pin(PBELT_PIN);
-    gpio_set_direction(PBELT_PIN, GPIO_MODE_INPUT);
-    gpio_pullup_en(PBELT_PIN);
+    // set on led pin config to output, level 0
+    gpio_reset_pin(ON_LED);
+    gpio_set_direction(ON_LED, GPIO_MODE_OUTPUT);
 
-    // set ignition button config to input and internal pullup
-    gpio_reset_pin(IGNITION_BUTTON);
-    gpio_set_direction(IGNITION_BUTTON, GPIO_MODE_INPUT);
-    gpio_pullup_en(IGNITION_BUTTON);
-
-    // set ready led pin config to output, level 0
-    gpio_reset_pin(READY_LED);
-    gpio_set_direction(READY_LED, GPIO_MODE_OUTPUT);
-
-    // set success led pin config to output, level 0
-    gpio_reset_pin(SUCCESS_LED);
-    gpio_set_direction(SUCCESS_LED, GPIO_MODE_OUTPUT);
-
-    // set alarm pin config to output, level 0
-    gpio_reset_pin(ALARM_PIN);
-    gpio_set_direction(ALARM_PIN, GPIO_MODE_OUTPUT);
+    // set refill led pin config to output, level 0
+    gpio_reset_pin(REFILL_LED);
+    gpio_set_direction(REFILL_LED, GPIO_MODE_OUTPUT);
     
-    // Initialize servo motor
-    ledc_init();
-    // Start with motor stopped
-    stop_servo_motor();
+    // SERVO MOTOR initialization //
+    ledc_init(); // Initialize servo motor
+    stop_servo_motor(); // Start with motor stopped
     
-    // POTENTIOMETER //
+    // POTENTIOMETER initialization (ADC) //
     // Initialize ADC
+    int PORTION_SEL_adc_bits;
+    int loop_count = 0;
+
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
     };                                                                  // Unit configuration
@@ -281,14 +278,10 @@ void app_main(void)
         .bitwidth = BITWIDTH
     };                                  // Channel configuration
 
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MODE_SELECTOR, &chan_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, PORTION_SEL, &chan_config));
     
-    // Create Task for LCD Display
-    xTaskCreate(lcd_task, "lcd_task", 4096, NULL, 5, NULL);
-    
-    int modeSel_adc_bits;
-    int delayTimeSel_adc_bits;
-    int loop_count = 0;
+    // LCD Display Initialization //
+    xTaskCreate(lcd_task, "lcd_task", 4096, NULL, 5, NULL); // Create Task for LCD Display
 
     // KEYPAD //
     init_keypad();  // initialize the keypad
@@ -306,20 +299,17 @@ void app_main(void)
         loop_count++;
 
         // Read ADC values
-        adc_oneshot_read(adc1_handle, MODE_SELECTOR, &modeSel_adc_bits);            // Read ADC bits (mode potentiometer)
+        adc_oneshot_read(adc1_handle, PORTION_SEL, &PORTION_SEL_adc_bits);            // Read ADC bits (mode potentiometer)
     
         // Read GPIO inputs
-        dseat = gpio_get_level(DSEAT_PIN) == 0;
-        pseat = gpio_get_level(PSEAT_PIN) == 0;
-        dbelt = gpio_get_level(DBELT_PIN) == 0;
-        pbelt = gpio_get_level(PBELT_PIN) == 0;
-        ignition = gpio_get_level(IGNITION_BUTTON) == 0;
-        
+        turn_on = gpio_get_level(ON_BUTTON) == 0;
+        select_portion = gpio_get_level(SELECT_BUTTON) == 0;
+        refill = gpio_get_level(REFILL_BUTTON) == 0;
+
         // Determine wiper mode selection
-        off_selected = (modeSel_adc_bits < OFF);
-        int_selected = (modeSel_adc_bits >= OFF && modeSel_adc_bits < INT);
-        low_selected = (modeSel_adc_bits >= INT && modeSel_adc_bits < LOW);
-        high_selected = (modeSel_adc_bits >= LOW);
+        small_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < small_portion);
+        medium_selected = (PORTION_SEL_adc_bits >= small_portion && PORTION_SEL_adc_bits < medium_portion);
+        large_selected = (PORTION_SEL_adc_bits >= medium_portion);
 
         //** FSM FOR KEYPAD **//
          // update FSM inputs
@@ -358,206 +348,297 @@ void app_main(void)
                 }
                 break;
         }
-        vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS)); // add loop delay
 
         //** SELECTION PROCESS SUBSYSTEM **//
         // if the ON button is pressed, print the welcome message once
-        if (dseat){
-            if (executed == 0){     // if executed equals 0, print welcome message
-                printf("Welcome to enhanced alarm system model 218-W25\n"); 
+        if (turn_on){
+            if (executed == 0 && on_led == 0){     // if executed equals 0, print welcome message
+                gpio_set_level(ON_LED, 1);
+                on_led = 1;
+                printf("Smart Pet Feeder Activated!\n");
+                vTaskDelay(MSG_DELAY/portTICK_PERIOD_MS);
                 executed = 1;       // set executed = 1 so welcome message only prints once
+                vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
             }
-        }
-
-        // Check if ignition is enabled
-        bool ignition_enabled = dseat && pseat && dbelt && pbelt;
         
-        // if all of the conditions are met
-        if (ignition_enabled){
-            //set ready led to ON
-            if (executed == 1 && ready_led == 0){
-                gpio_set_level(READY_LED, 1);
-                ready_led = 1;
-            }
-            // if ignition button is pressed while all conditions are met
-            if (ignition == true && executed == 1){
-                // turn on ignition LED and turn off ready LED
-                gpio_set_level(SUCCESS_LED, 1);
-                gpio_set_level(READY_LED, 0);
-                gpio_set_level(ALARM_PIN, 0);
-                engine_running = true;
-                // print engine started message once
-                printf("Engine started!\n");
-                executed = 2;       // set executed = 2 so engine started message only prints once
-            }
-        }
-
-        // otherwise (at least one condition is not satisfied)
-        else{
-            // set ready LED to OFF and set variable ready_led to 0
-            gpio_set_level(READY_LED,0);
-            ready_led = 0;
-            // if ignition button is pressed while conditions are not satisfied
-            if (ignition==true && executed < 2){
-                    // turn on alarm buzzer
-                    gpio_set_level(ALARM_PIN, 1);
-                    printf("Ignition inhibited.\n");
-                    // check which conditions are not met, print corresponding message
-                    if (!pseat){
-                        printf("Passenger seat not occupied.\n");
-                    }
-                    if (!dseat){
-                        printf("Driver seat not occupied.\n");
-                    }
-                    if (!pbelt){
-                        printf("Passenger seatbelt not fastened.\n");
-                    }
-                    if (!dbelt){
-                        printf("Drivers seatbelt not fastened.\n");
-                    }
-                    executed = 4;   
-            }
-        }
-
-        // if executed = 4 (failed ignition) and ignition button is released
-        if (ignition == false && executed == 4){
-            // reset to state after welcome message, testing for conditions
-            executed = 1;
-        }
-
-        // if ignition is successfully started and then ignition is released, set ignition_off = 1
-        if (executed == 2 && ignition == false){
-            ignition_off = 1;
-        }
-
-        // if ignition_off = 1 and inition is pressed, turn off all LEDs
-        if (ignition_off==1 && ignition == true){
-            engine_running = false;
-            gpio_set_level(SUCCESS_LED,0);          // turn off ignition
-            state = 0; // Reset wiper to park
-            duty = LEDC_DUTY_MIN;
-            stop_servo_motor();
-            executed = 3;                           // set executed = 3 to keep LEDs off
-        } 
-        last_ignition_button = ignition;
-
-        //** WINDSHIELD WIPER SUBSYSTEM **//
-        
-        if (engine_running) {
+        if (executed == 1) {
             // Determine delay time
-            if (delayTimeSel_adc_bits < timeDelaySel1) {
-                INTtimeDelay = 1000; // SHORT
-            } else if (delayTimeSel_adc_bits < timeDelaySel2) {
-                INTtimeDelay = 3000; // MEDIUM
+            if (PORTION_SEL_adc_bits < small_portion) {
+                mode = 0; // SHORT
+            } else if (PORTION_SEL_adc_bits < medium_portion) {
+                mode = 1; // MEDIUM
             } else {
-                INTtimeDelay = 5000; // LONG
+                mode = 2; // LONG
             }
+        vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
 
-            // Determine mode (for display)
-            int old_mode = mode;
-            if (off_selected) {
-                mode = 0;
-            }
-            else if (int_selected) {
-                mode = 1;
-            }
-            else if (low_selected) {
-                mode = 2;
-            }
-            else {
-                mode = 3;
-            }
+            // // Determine mode (for display)
+            // int old_mode = mode;
+            // if (small_selected) {
+            //     mode = 0;
+            // }
+            // else if (medium_selected) {
+            //     mode = 1;
+            // }
+            // else {
+            //     mode = 2;
+            // }
 
-            // Determine selected speed
-            if (high_selected) {
-                requested_step = STEP_HIGH_SPEED;
-            } else {
-                requested_step = STEP_LOW_SPEED;
-            }
-
-            // States for wiper control
-            int old_state = state;
-            bool entering_new_state = false;
+        //     // Determine mode (for display)
+        //     int old_mode = mode;
+        //     if (small_selected) {
+        //         mode = 0;
+        //     }
+        //     else if (medium_selected) {
+        //         mode = 1;
+        //     }
+        //     else {
+        //         mode = 2;
+        //     }
+        // }
+        //     if (executed == 1) {
+        //         if (small_selected) {
+        //             mode = 1;
+        //             choose_small = true;
+        //         }
+        //         else if (medium_selected) {
+        //             mode = 2;
+        //             choose_medium = true;
+        //         }
+        //         else {
+        //             mode = 3;
+        //             choose_large = true;
+        //         }
             
-            // Wipers parked at 0 degrees
-            if (state == 0) {
-                // Only set position when first entering this state
-                if (old_state != 0) {
-                    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
-                    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-                    entering_new_state = true;
-                }
-                
-                // Start moving if mode selected
-                if (int_selected) {
-                    state = 1; // wait at 0 degrees
-                    timeInterval = 0;
-                    current_step = requested_step; // set requested speed
-                } else if (low_selected || high_selected) {
-                    state = 2; // start moving up immediately
-                    current_step = requested_step; // set speed
-                }
-            }
-            
-            // INT mode (waiting at 0 degrees for the selected delay time)
-            else if (state == 1) {
-                timeInterval += 20;
-                
-                // Only set position when first entering wait state
-                if (old_state != 1) {
-                    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
-                    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-                    entering_new_state = true;
-                }
-                
-                // Check if we should exit wait
-                if (off_selected) {
-                    state = 0; // Stay parked
-                } else if (timeInterval >= INTtimeDelay) {
-                    state = 2; // Start moving up
-                }
-            }
-            
-            // Wipers moving up from 0 to 90 degrees
-            else if (state == 2) {
-                duty += current_step;
-                if (duty >= LEDC_DUTY_MAX) {
-                    duty = LEDC_DUTY_MAX;
-                    state = 3; // Start moving down
-                }
-                ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
-                ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-            }
-            
-            // Wipers moving down from 90 to 0 degrees
-            else if (state == 3) {
-                duty -= current_step;
-                if (duty <= LEDC_DUTY_MIN) {
-                    duty = LEDC_DUTY_MIN;
-                    // Update speed for next cycle
-                    current_step = requested_step;
-                    // Determine next state based on mode
-                    if (off_selected) {
-                        state = 0; // reset wipers to park
-                    } else if (int_selected) {
-                        state = 1; // have wipers wait
-                        timeInterval = 0;
-                    } else {
-                        state = 2; // Continuous (LOW/HIGH)
-                    }
-                } else {
-                    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
-                    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-                }
-            }
-            
-        } else {
-            // Engine off, make sure wipers are parked
-            if (state != 0) {
-                state = 0;
-                duty = LEDC_DUTY_MIN;
-                stop_servo_motor();
+                // if you press the on button then the screen will say welcome for 2 seconds
+                // then it will show you on the lcd that you have different portion selections
+                // when you turn to a certain portion and click select, then it will go to a different state where
+                    // you will be asked to input the 
             }
         }
     }
 }
+        // // Check if ignition is enabled
+        // bool ignition_enabled = dseat && pseat && dbelt && pbelt;
+        
+        // if all of the conditions are met
+        // if (executed == 1){
+        //     //set ready led to ON
+        //     if (executed == 1 && ready_led == 0){
+        //         gpio_set_level(READY_LED, 1);
+        //         ready_led = 1;
+        //     }
+        //     // if ignition button is pressed while all conditions are met
+        //     if (ignition == true && executed == 1){
+        //         // turn on ignition LED and turn off ready LED
+        //         gpio_set_level(SUCCESS_LED, 1);
+        //         gpio_set_level(READY_LED, 0);
+        //         gpio_set_level(ALARM_PIN, 0);
+        //         engine_running = true;
+        //         // print engine started message once
+        //         printf("Engine started!\n");
+        //         executed = 2;       // set executed = 2 so engine started message only prints once
+        //     }
+        // }
+
+        // otherwise (at least one condition is not satisfied)
+        // else{
+        //     // set ready LED to OFF and set variable ready_led to 0
+        //     gpio_set_level(READY_LED,0);
+        //     ready_led = 0;
+        //     // if ignition button is pressed while conditions are not satisfied
+        //     if (ignition==true && executed < 2){
+        //             // turn on alarm buzzer
+        //             gpio_set_level(ALARM_PIN, 1);
+        //             printf("Ignition inhibited.\n");
+        //             // check which conditions are not met, print corresponding message
+        //             if (!pseat){
+        //                 printf("Passenger seat not occupied.\n");
+        //             }
+        //             if (!dseat){
+        //                 printf("Driver seat not occupied.\n");
+        //             }
+        //             if (!pbelt){
+        //                 printf("Passenger seatbelt not fastened.\n");
+        //             }
+        //             if (!dbelt){
+        //                 printf("Drivers seatbelt not fastened.\n");
+        //             }
+        //             executed = 4;   
+        //     }
+        // }
+        //         // if iginition successful, set low beams according to potentiometer
+        // if(executed == 2){
+        //     // if potentiometer set to off, set low beam leds to off, set lowbeam = 0
+        //     if(adc_mV < 1000){
+        //         gpio_set_level(HEADLIGHT_LED,0);
+        //         // gpio_set_level(HIGHBEAM_LED, 0);
+        //         lowbeam = 0;
+        //     }
+        //     // if potentiometer set to auto, use LDR to determine led high/low
+        //     else if(adc_mV >= 1000 && adc_mV < 2250){
+        //         // if LDR high mV (daylight) for 2s, turn off low beams, set lowbeam = 0
+        //         if (ldr_adc_mV > 2000 && lowbeam == 1){
+        //             vTaskDelay(MSG_DELAY/portTICK_PERIOD_MS);
+        //             if(ldr_adc_mV > 2000){
+        //                 gpio_set_level(HEADLIGHT_LED, 0);
+        //                 lowbeam = 0;
+        //             }
+        //         }
+                // if LDR low mV (dusk/night) for 1s, turn on low beams, set lowbeam = 1
+        //         else if (ldr_adc_mV < 1550 && lowbeam == 0){
+        //             vTaskDelay(1000 / portTICK_PERIOD_MS);
+        //             if (ldr_adc_mV < 1550){
+        //                 gpio_set_level(HEADLIGHT_LED, 1);
+        //                 lowbeam = 1;
+        //                 }
+                        
+        //             }
+        //         }
+        //     // if potentiometer set to on, turn on low beams, set lowbeam = 1
+        //     else if(adc_mV >= 2250){
+        //         gpio_set_level(HEADLIGHT_LED,1);
+        //         lowbeam = 1;
+        //     }
+                            
+        // }
+
+        // if executed = 4 (failed ignition) and ignition button is released
+        // if (ignition == false && executed == 4){
+        //     // reset to state after welcome message, testing for conditions
+        //     executed = 1;
+        // }
+
+        // // if ignition is successfully started and then ignition is released, set ignition_off = 1
+        // if (executed == 2 && ignition == false){
+        //     ignition_off = 1;
+        // }
+
+        // // if ignition_off = 1 and inition is pressed, turn off all LEDs
+        // if (ignition_off==1 && ignition == true){
+        //     engine_running = false;
+        //     gpio_set_level(SUCCESS_LED,0);          // turn off ignition
+        //     state = 0; // Reset wiper to park
+        //     duty = LEDC_DUTY_MIN;
+        //     stop_servo_motor();
+        //     executed = 3;                           // set executed = 3 to keep LEDs off
+        // } 
+        // last_ignition_button = ignition;
+
+        //** WINDSHIELD WIPER SUBSYSTEM **//
+        
+        // if (executed == 1) {
+            // // Determine delay time
+            // if (delayTimeSel_adc_bits < timeDelaySel1) {
+            //     INTtimeDelay = 1000; // SHORT
+            // } else if (delayTimeSel_adc_bits < timeDelaySel2) {
+            //     INTtimeDelay = 3000; // MEDIUM
+            // } else {
+            //     INTtimeDelay = 5000; // LONG
+            // }
+
+        //     // Determine mode (for display)
+        //     int old_mode = mode;
+        //     if (small_selected) {
+        //         mode = 0;
+        //     }
+        //     else if (medium_selected) {
+        //         mode = 1;
+        //     }
+        //     else {
+        //         mode = 2;
+        //     }
+        // }
+            // // Determine selected speed
+            // if (high_selected) {
+            //     requested_step = STEP_HIGH_SPEED;
+            // } else {
+            //     requested_step = STEP_LOW_SPEED;
+            // }
+
+            // States for wiper control
+            // int old_state = state;
+            // bool entering_new_state = false;
+            
+            // // Wipers parked at 0 degrees
+            // if (state == 0) {
+            //     // Only set position when first entering this state
+            //     if (old_state != 0) {
+            //         ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
+            //         ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+            //         entering_new_state = true;
+            //     }
+                
+            //     // Start moving if mode selected
+            //     if (int_selected) {
+            //         state = 1; // wait at 0 degrees
+            //         timeInterval = 0;
+            //         current_step = requested_step; // set requested speed
+            //     } else if (low_selected || high_selected) {
+            //         state = 2; // start moving up immediately
+            //         current_step = requested_step; // set speed
+            //     }
+            // }
+            
+            // // INT mode (waiting at 0 degrees for the selected delay time)
+            // else if (state == 1) {
+            //     timeInterval += 20;
+                
+            //     // Only set position when first entering wait state
+            //     if (old_state != 1) {
+            //         ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
+            //         ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+            //         entering_new_state = true;
+            //     }
+                
+            //     // Check if we should exit wait
+            //     if (off_selected) {
+            //         state = 0; // Stay parked
+            //     } else if (timeInterval >= INTtimeDelay) {
+            //         state = 2; // Start moving up
+            //     }
+            // }
+            
+    //         // Wipers moving up from 0 to 90 degrees
+    //         else if (state == 2) {
+    //             duty += current_step;
+    //             if (duty >= LEDC_DUTY_MAX) {
+    //                 duty = LEDC_DUTY_MAX;
+    //                 state = 3; // Start moving down
+    //             }
+    //             ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
+    //             ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    //         }
+            
+    //         // Wipers moving down from 90 to 0 degrees
+    //         else if (state == 3) {
+    //             duty -= current_step;
+    //             if (duty <= LEDC_DUTY_MIN) {
+    //                 duty = LEDC_DUTY_MIN;
+    //                 // Update speed for next cycle
+    //                 current_step = requested_step;
+    //                 // Determine next state based on mode
+    //                 if (off_selected) {
+    //                     state = 0; // reset wipers to park
+    //                 } else if (int_selected) {
+    //                     state = 1; // have wipers wait
+    //                     timeInterval = 0;
+    //                 } else {
+    //                     state = 2; // Continuous (LOW/HIGH)
+    //                 }
+    //             } else {
+    //                 ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
+    //                 ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    //             }
+    //         }
+            
+    //     } else {
+    //         // Engine off, make sure wipers are parked
+    //         if (state != 0) {
+    //             state = 0;
+    //             duty = LEDC_DUTY_MIN;
+    //             stop_servo_motor();
+    //         }
+    //     }
+    // }
+// }

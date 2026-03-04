@@ -4,7 +4,6 @@
     "board/esp32s3-builtin.cfg"
   ],
   "idf.customExtraVars": {
-    "OPENOCD_USB_ADAPTER_LOCATION": "1-2",
     "IDF_TARGET": "esp32s3"
   },
   "clangd.path": "c:\\Espressif\\frameworks\\esp-idf-v5.5.2\\tools\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
@@ -13,5 +12,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\ESP32\\ESP32_Exercises\\LCD_display\\default\\build"
   ],
-  "idf.currentSetup": "/Users/miavatanapradit/esp/esp-idf"
+  "idf.currentSetup": "/Users/miavatanapradit/esp/esp-idf",
+  "idf.port": "/dev/tty.usbmodem1101"
 }
