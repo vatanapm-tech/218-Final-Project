@@ -11,6 +11,10 @@
 #include "stdio.h"
 #include "esp_adc/adc_cali.h"
 #include "freertos/timers.h"
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 
 // INPUT & OUTPUT variables
 #define ON_LED               GPIO_NUM_21      // On LED pin 21
@@ -33,11 +37,13 @@
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 #define LEDC_FREQUENCY          (50) // Frequency in Hertz. 50 Hz for a 20ms period.
-#define LEDC_DUTY_MIN           (240) // Set duty to 2.7% (0 deg angle position) (min pulse width)
-#define LEDC_DUTY_MAX           (590) // Set duty to 7.2% to achieve an angle of 90% (max pulse width)
-        // step sizes to change how fast the servo motor rotates
-#define STEP_HIGH_SPEED      (12.2) // fast speed -- 90 deg in 0.6 sec
-#define STEP_LOW_SPEED       (4.92) // slow speed -- 90 deg in 1.5 sec
+#define LEDC_DUTY_STOP           (240) // Set duty to 2.7% (0 deg angle position) (min pulse width)
+#define LEDC_DUTY_FWD           (270) // Set duty to spin forward
+        // Disk dispenser: 8 slices, each slice = 45 degrees
+        // 45 deg duty = LEDC_DUTY_MIN + (LEDC_DUTY_MAX - LEDC_DUTY_MIN) / 2 = 415
+#define SLICE_ROTATE_MS         (500) // 
+#define SLICE_SETTLE_MS         (300) // 
+#define TOTAL_FOOD_SLICES       (7)
 
 // Keypad variables
 #define LOOP_DELAY_MS           10      // Loop sampling time (ms)
@@ -46,6 +52,12 @@
 #define NCOLS                   4       // Number of keypad columns
 #define ACTIVE                  0       // Keypad active state (0 = low, 1 = high)
 #define NOPRESS                 '\0'    // NOPRESS character
+
+// Feeding schedule/refill defines
+#define SMALL_MAX            1365       // ADC < 1365  → SMALL
+#define MEDIUM_MAX           2730       // ADC < 2730  → MEDIUM, >= 2730 → LARGE
+#define REFILL_THRESHOLD     7         // total rotations before refill LED triggers
+#define MAX_DIGITS           2          // max digits for feedings-per-day entry
 
 // Initialize keypad rows, columns, layout
 int row_pins[] = {GPIO_NUM_14, GPIO_NUM_13, GPIO_NUM_12, GPIO_NUM_11};     // Pin numbers for rows
@@ -63,53 +75,50 @@ bool select_portion = false;
 bool refill = false;
 int executed = 0;
 int on_led = 0;
-// bool dseat = false;     
-// bool pseat = false;     
-// bool dbelt = false;     
-// bool pbelt = false;     
-// bool ignition = false;  
-// bool engine_running = false;
-// bool last_ignition_button = false;
-// int executed = 0;
-// int ready_led = 0;
-// int ignition_off = 0;
-// int error = 0;
 
-// Wiper system globals
-// int OFF = 1024;
-// int INT = 2048;
-// int LOW = 3072;
-// bool off_selected = false;
-// bool int_selected = false;
-// bool low_selected = false;
-// bool high_selected = false;
-// int timeDelaySel1 = 1365;
-// int timeDelaySel2 = 2730;
+// Portion Selection globals
 bool small_selected = false;
 bool medium_selected = false;
 bool large_selected = false;
-int INTtimeDelay = 1000;
 int mode = 0;           // Current mode: 0=SMALL, 1=MEDIUM, 2=LARGE
-int state = 0;          // Different wiper states: 0=PARKED, 1=WAIT, 2=UP, 3=DOWN
-int timeInterval = 0;
-float duty = LEDC_DUTY_MIN;
-float current_step = STEP_LOW_SPEED;
-float requested_step = STEP_LOW_SPEED;
 
-int small_portion = 1365;
-int medium_portion = 2730;
+// Feeding Schedule globals
+int slices = 0; // rotations to perform this dispense (1,2,3)
+int slice_count = 0; // total rotations since last refill
+int feed_hour = 0;   // feed hour inputted on keypad (0-23)
+int feed_minute = 0; // feed minute inputted on keypad (0-59)
+int seconds_until_feed = 0; // current countdown value
 
-bool choose_small = false;
-bool choose_medium = false;
-bool choose_large = false;
+// Keypad input buffer
+char keypad_buf[MAX_DIGITS + 1];
+int digit_count = 0;
 
 // LCD global handling
 hd44780_t lcd_display;
 
 // Stop the servo motor at 0 degrees
 void stop_servo_motor(void) {
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_STOP);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
+// Rotate disk 45 degrees to dispense one slice of food, then stop and wait for food to fall using delay
+void dispense_one_slice(void) {
+    // Move to 45 deg (one slice forward)
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_FWD);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    vTaskDelay(SLICE_ROTATE_MS / portTICK_PERIOD_MS);   // wait for food to fall through
+    stop_servo_motor();
+    vTaskDelay(SLICE_SETTLE_MS / portTICK_PERIOD_MS);
+}
+
+// After all 7 slices are used, rotate another 45 degrees to return to starting position
+void return_to_home(void) {
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_FWD);
+    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    vTaskDelay(SLICE_ROTATE_MS / portTICK_PERIOD_MS);
+    stop_servo_motor();
+    printf("Disk returned to starting position. \n"); // print debugger to verify
 }
 
 // LCD Task
@@ -129,13 +138,15 @@ void lcd_task(void *pvParameters)
 
     ESP_ERROR_CHECK(hd44780_init(&lcd_display));
 
+    char line2[17];
+
     while (1)
     {
         // Clear the display
         hd44780_clear(&lcd_display);
         
         if (turn_on && executed == 0) {
-            // Show "Wiper mode:" on first line
+            // Show message when system turned on
             hd44780_gotoxy(&lcd_display, 0, 0);
             hd44780_puts(&lcd_display, "Smart Pet Feeder");
             hd44780_gotoxy(&lcd_display, 0, 1);
@@ -157,15 +168,65 @@ void lcd_task(void *pvParameters)
                 hd44780_puts(&lcd_display, "LARGE");
             }
         }
-        vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
+
+        if (executed == 2) {
+            // feeding time entry via keypad (in military time HH:MM)
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            hd44780_puts(&lcd_display, "Feed time (HHMM)");
+            hd44780_gotoxy(&lcd_display, 0, 1);
+            // Format typed digits as HH:MM with cursor
+            char formatted[17]; // buffer for formatted string
+            if (digit_count <= 2) { // only hours entered so far, show as HH_
+                snprintf(formatted, sizeof(formatted), "%s_", keypad_buf); // append underscore cursor to end of input
+            } else {
+                snprintf(formatted, sizeof(formatted), "%.2s:%.2s_", // format first two digits as hours, next two as minutes, append underscore cursor
+                         keypad_buf, keypad_buf + 2); // point to same buffer but offset by 2 to get minutes portion
+            }
+            hd44780_puts(&lcd_display, formatted); // display formatted input on LCD
         }
-        // } else {
-        //     // Engine is off
-        //     hd44780_gotoxy(&lcd_display, 0, 0);
-        //     hd44780_puts(&lcd_display, "System Off");
-        // }
-        // Add delay
-        
+
+        if (executed == 3) {
+            // Counting down to next feeding — show target time and remaining seconds
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            snprintf(line2, sizeof(line2), "Feed at %02d:%02d", feed_hour, feed_minute);
+            hd44780_puts(&lcd_display, line2);
+            hd44780_gotoxy(&lcd_display, 0, 1);
+            snprintf(line2, sizeof(line2), "%d sec", seconds_until_feed);
+            hd44780_puts(&lcd_display, line2);
+        }
+
+        if (executed == 6) {
+            // Low food warning
+            int slices_remaining = REFILL_THRESHOLD - slice_count;
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            hd44780_puts(&lcd_display, "Low food!");
+            // hd44780_gotoxy(&lcd_display, 0, 1);
+            // snprintf(line2, sizeof(line2), "%d left, need %d", slices_remaining, slices);
+            // hd44780_puts(&lcd_display, line2);
+        }
+
+        if (executed == 4) {
+            // Dispensing — show partial warning if not enough slices
+            int slices_remaining = REFILL_THRESHOLD - slice_count;
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            hd44780_puts(&lcd_display, "Dispensing...");
+            hd44780_gotoxy(&lcd_display, 0, 1);
+            if (slices_remaining < slices && slices_remaining > 0) {
+                hd44780_puts(&lcd_display, "Partial portion!");
+            } else {
+                hd44780_puts(&lcd_display, "");
+            }
+        }
+
+        if (executed == 5) {
+            // Refill needed
+            hd44780_gotoxy(&lcd_display, 0, 0);
+            hd44780_puts(&lcd_display, "Refill needed!");
+            hd44780_gotoxy(&lcd_display, 0, 1);
+            hd44780_puts(&lcd_display, "Press REFILL btn");
+        }
+        vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
+    }     
 }
 
 
@@ -283,6 +344,19 @@ void app_main(void)
     // LCD Display Initialization //
     xTaskCreate(lcd_task, "lcd_task", 4096, NULL, 5, NULL); // Create Task for LCD Display
 
+    // Set system clock to current time before flashing
+    // NEED TO UPDATE t.tm_hour AND t.tm_min TO THE CURRENT TIME BEFORE FLASHING
+    struct timeval demo_time = {0};
+    struct tm t = {0};
+    t.tm_year = 125;    // years since 1900 (2025)
+    t.tm_mon  = 2;      // month (0-indexed, 2 = March)
+    t.tm_mday = 5;      // day of month
+    t.tm_hour = 15;     // !! SET THIS to current hour (24hr format) !!
+    t.tm_min  = 59;     // !! SET THIS to current minute !!
+    t.tm_sec  = 0;
+    demo_time.tv_sec = mktime(&t);
+    settimeofday(&demo_time, NULL);
+
     // KEYPAD //
     init_keypad();  // initialize the keypad
 
@@ -290,9 +364,13 @@ void app_main(void)
     State_t state = Wait_for_press; // initial state
     char new_key = NOPRESS;         // key currently pressed
     char last_key = NOPRESS;        // last key pressed
+    char confirmed_key = NOPRESS;   // set only on the cycle a keypress is confirmed 
     int time = 0;                   // time debounce delay verify
     bool timed_out = false;         // checks if key pressed lasts longer than debounce time
     
+    // clear keypad buffer
+    memset(keypad_buf, 0, sizeof(keypad_buf));
+
     while (1)
     {
         vTaskDelay(20 / portTICK_PERIOD_MS);
@@ -307,12 +385,13 @@ void app_main(void)
         refill = gpio_get_level(REFILL_BUTTON) == 0;
 
         // Determine wiper mode selection
-        small_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < small_portion);
-        medium_selected = (PORTION_SEL_adc_bits >= small_portion && PORTION_SEL_adc_bits < medium_portion);
-        large_selected = (PORTION_SEL_adc_bits >= medium_portion);
+        small_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < SMALL_MAX);
+        medium_selected = (PORTION_SEL_adc_bits >= SMALL_MAX && PORTION_SEL_adc_bits < MEDIUM_MAX);
+        large_selected = (PORTION_SEL_adc_bits >= MEDIUM_MAX);
 
         //** FSM FOR KEYPAD **//
-         // update FSM inputs
+        // update FSM inputs
+        confirmed_key = NOPRESS;
         new_key = scan_keypad();                    // assign each new key press as the key that is returned from scan_keypad function 
         timed_out = (time >= DEBOUNCE_TIME);        // checks if key pressed lasts longer than debounce time 
 
@@ -330,7 +409,7 @@ void app_main(void)
             case Debounce:
                 if (timed_out) {                                // if the debounce time of 40 ms has passed and key pressed remains same, 
                     if (new_key == last_key) {                  // confirm valid key press
-                        printf("Key Pressed: %c\n", last_key);  // print once whichever key is being pressed
+                        confirmed_key = last_key;               // mark key as confirmed for this cycle
                         state = Wait_for_release;               // transition to next state
                     } else {                                    // or else, if the key changed during debounce delay (glitch), 
                         state = Wait_for_press;                 // go back to initial state
@@ -350,295 +429,192 @@ void app_main(void)
         }
 
         //** SELECTION PROCESS SUBSYSTEM **//
+
         // if the ON button is pressed, print the welcome message once
         if (turn_on){
             if (executed == 0 && on_led == 0){     // if executed equals 0, print welcome message
                 gpio_set_level(ON_LED, 1);
                 on_led = 1;
                 printf("Smart Pet Feeder Activated!\n");
-                vTaskDelay(MSG_DELAY/portTICK_PERIOD_MS);
+                vTaskDelay(MSG_DELAY / portTICK_PERIOD_MS);
                 executed = 1;       // set executed = 1 so welcome message only prints once
-                vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
-            }
-        
-        if (executed == 1) {
-            // Determine delay time
-            if (PORTION_SEL_adc_bits < small_portion) {
-                mode = 0; // SHORT
-            } else if (PORTION_SEL_adc_bits < medium_portion) {
-                mode = 1; // MEDIUM
-            } else {
-                mode = 2; // LONG
-            }
-        vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
-
-            // // Determine mode (for display)
-            // int old_mode = mode;
-            // if (small_selected) {
-            //     mode = 0;
-            // }
-            // else if (medium_selected) {
-            //     mode = 1;
-            // }
-            // else {
-            //     mode = 2;
-            // }
-
-        //     // Determine mode (for display)
-        //     int old_mode = mode;
-        //     if (small_selected) {
-        //         mode = 0;
-        //     }
-        //     else if (medium_selected) {
-        //         mode = 1;
-        //     }
-        //     else {
-        //         mode = 2;
-        //     }
-        // }
-        //     if (executed == 1) {
-        //         if (small_selected) {
-        //             mode = 1;
-        //             choose_small = true;
-        //         }
-        //         else if (medium_selected) {
-        //             mode = 2;
-        //             choose_medium = true;
-        //         }
-        //         else {
-        //             mode = 3;
-        //             choose_large = true;
-        //         }
-            
-                // if you press the on button then the screen will say welcome for 2 seconds
-                // then it will show you on the lcd that you have different portion selections
-                // when you turn to a certain portion and click select, then it will go to a different state where
-                    // you will be asked to input the 
+                vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
             }
         }
+
+        // portion selection
+        if (executed == 1) {
+            // update mode on potentiometer
+            if (small_selected) {
+                mode = 0; // SHORT
+            } else if (medium_selected) {
+                mode = 1; // MEDIUM
+            } else {
+                mode = 2; // LARGE
+            }
+
+            // Lock in portion when SELECT button is pressed
+            if (select_portion) {
+                slices = mode + 1;      // SMALL=1 slice, MEDIUM=2 slices, LARGE=3 slices
+                printf("Portion selected: %s (%d slice(s))\n",
+                    mode == 0 ? "SMALL" : mode == 1 ? "MEDIUM" : "LARGE", slices);
+                memset(keypad_buf, 0, sizeof(keypad_buf));
+                digit_count = 0;
+                vTaskDelay(300 / portTICK_PERIOD_MS);   // brief delay to avoid button bounce
+                executed = 2;
+            }
+        }
+
+        // enter feeding time in military time (HHMM) on keypad and then confirm with select button
+        if (executed == 2) {
+            if (confirmed_key != NOPRESS) {
+                if (confirmed_key >= '0' && confirmed_key <= '9' && digit_count < MAX_DIGITS) {
+                    // append digit to buffer
+                    keypad_buf[digit_count] = confirmed_key;
+                    digit_count++;
+                    keypad_buf[digit_count] = '\0';
+                    printf("Time input so far: %s\n", keypad_buf);
+
+                } else if (confirmed_key == '*' && digit_count > 0) {
+                    // backspace: remove last digit
+                    digit_count--;
+                    keypad_buf[digit_count] = '\0';
+                    printf("Backspace. Input now: %s\n", keypad_buf);
+                }
+            }
+            
+            // press select button to confirm the 4 digit time entry
+            if (select_portion && digit_count == 4) {
+                // parse HHMM into hours and minutes
+                char hh[3] = {keypad_buf[0], keypad_buf[1], '\0'};
+                char mm[3] = {keypad_buf[2], keypad_buf[3], '\0'};
+                feed_hour   = atoi(hh);
+                feed_minute = atoi(mm);
+
+                // validate range
+                if (feed_hour > 23) feed_hour = 23;
+                if (feed_minute > 59) feed_minute = 59;
+
+                // get current time and calculate seconds until target
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                struct tm *now = localtime(&tv.tv_sec);
+
+                int current_seconds = now->tm_hour * 3600 + now->tm_min * 60 + now->tm_sec;
+                int target_seconds  = feed_hour * 3600 + feed_minute * 60;
+
+                // if target is earlier in the day than now, schedule for tomorrow
+                if (target_seconds <= current_seconds) {
+                    target_seconds += 24 * 3600;
+                }
+
+                seconds_until_feed = target_seconds - current_seconds;
+                printf("Feed scheduled for %02d:%02d. Countdown: %d seconds.\n",
+                       feed_hour, feed_minute, seconds_until_feed);
+                vTaskDelay(300 / portTICK_PERIOD_MS);   // brief delay to avoid button bounce
+                executed = 3;
+            }
+        }
+
+        // executed == 3: countdown to next feeding (non-blocking, 100 cycles of 10ms = 1 second)
+        if (executed == 3) {
+            static int cycle_count = 0;
+            cycle_count++;
+            if (cycle_count >= 100) {
+                cycle_count = 0;
+                if (seconds_until_feed > 0) {
+                    seconds_until_feed--;
+                }
+                if (seconds_until_feed <= 0) {
+                    // check if enough slices before dispensing
+                    int slices_remaining = REFILL_THRESHOLD - slice_count;
+                    if (slices_remaining < slices) {
+                        executed = 6;   // not enough — show warning first
+                    } else {
+                        executed = 4;   // enough slices — dispense normally
+                    }
+                }
+            }
+        }
+
+        // executed == 6: low food warning — not enough slices for the selected portion
+        //               SELECT to dispense what's left anyway, REFILL to cancel and refill first
+        if (executed == 6) {
+            if (select_portion) {
+                // user accepts partial portion — proceed to dispense
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                executed = 4;
+            }
+            if (refill) {
+                // user wants to refill first — go straight to refill alert
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                return_to_home();
+                gpio_set_level(REFILL_LED, 1);
+                executed = 5;
+            }
+        }
+
+        // executed == 4: dispense food
+        if (executed == 4) {
+            int slices_remaining = REFILL_THRESHOLD - slice_count;  // how many slices are left
+
+            if (slices_remaining <= 0) {
+                // no slices left at all — skip dispensing, go straight to refill alert
+                printf("No slices remaining. Refill needed!\n");
+                return_to_home();
+                gpio_set_level(REFILL_LED, 1);
+                executed = 5;
+
+            } else if (slices_remaining < slices) {
+                // not enough slices for the full portion — dispense what is left
+                printf("Only %d slice(s) left, dispensing partial portion.\n", slices_remaining);
+                for (int i = 0; i < slices_remaining; i++) {
+                    dispense_one_slice();
+                    slice_count++;
+                }
+                printf("Partial portion dispensed. Refill needed!\n");
+                return_to_home();
+                gpio_set_level(REFILL_LED, 1);
+                executed = 5;
+
+            } else {
+                // enough slices for the full portion — dispense normally
+                printf("Dispensing %d slice(s)...\n", slices);
+                for (int i = 0; i < slices; i++) {
+                    dispense_one_slice();
+                    slice_count++;
+                }
+                printf("Dispensed. Total slices since refill: %d\n", slice_count);
+
+                if (slice_count >= REFILL_THRESHOLD) {
+                    // all 7 slices used — return to home and trigger refill
+                    return_to_home();
+                    gpio_set_level(REFILL_LED, 1);
+                    printf("Refill needed!\n");
+                    executed = 5;
+                } else {
+                    // schedule next feeding for same time tomorrow
+                    seconds_until_feed = 24 * 3600;
+                    printf("Next feed at %02d:%02d tomorrow. Countdown: %d seconds.\n",
+                           feed_hour, feed_minute, seconds_until_feed);
+                    executed = 3;
+                }
+            }
+        }
+
+        // executed == 5: refill alert — wait for refill button
+        if (executed == 5) {
+            if (refill) {
+                slice_count = 0;
+                gpio_set_level(REFILL_LED, 0);
+                printf("Refill acknowledged. Resuming schedule.\n");
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                seconds_until_feed = 24 * 3600;  // resume — next feed same time tomorrow
+                executed = 3;
+            }
+        }
+        vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
     }
 }
-        // // Check if ignition is enabled
-        // bool ignition_enabled = dseat && pseat && dbelt && pbelt;
         
-        // if all of the conditions are met
-        // if (executed == 1){
-        //     //set ready led to ON
-        //     if (executed == 1 && ready_led == 0){
-        //         gpio_set_level(READY_LED, 1);
-        //         ready_led = 1;
-        //     }
-        //     // if ignition button is pressed while all conditions are met
-        //     if (ignition == true && executed == 1){
-        //         // turn on ignition LED and turn off ready LED
-        //         gpio_set_level(SUCCESS_LED, 1);
-        //         gpio_set_level(READY_LED, 0);
-        //         gpio_set_level(ALARM_PIN, 0);
-        //         engine_running = true;
-        //         // print engine started message once
-        //         printf("Engine started!\n");
-        //         executed = 2;       // set executed = 2 so engine started message only prints once
-        //     }
-        // }
 
-        // otherwise (at least one condition is not satisfied)
-        // else{
-        //     // set ready LED to OFF and set variable ready_led to 0
-        //     gpio_set_level(READY_LED,0);
-        //     ready_led = 0;
-        //     // if ignition button is pressed while conditions are not satisfied
-        //     if (ignition==true && executed < 2){
-        //             // turn on alarm buzzer
-        //             gpio_set_level(ALARM_PIN, 1);
-        //             printf("Ignition inhibited.\n");
-        //             // check which conditions are not met, print corresponding message
-        //             if (!pseat){
-        //                 printf("Passenger seat not occupied.\n");
-        //             }
-        //             if (!dseat){
-        //                 printf("Driver seat not occupied.\n");
-        //             }
-        //             if (!pbelt){
-        //                 printf("Passenger seatbelt not fastened.\n");
-        //             }
-        //             if (!dbelt){
-        //                 printf("Drivers seatbelt not fastened.\n");
-        //             }
-        //             executed = 4;   
-        //     }
-        // }
-        //         // if iginition successful, set low beams according to potentiometer
-        // if(executed == 2){
-        //     // if potentiometer set to off, set low beam leds to off, set lowbeam = 0
-        //     if(adc_mV < 1000){
-        //         gpio_set_level(HEADLIGHT_LED,0);
-        //         // gpio_set_level(HIGHBEAM_LED, 0);
-        //         lowbeam = 0;
-        //     }
-        //     // if potentiometer set to auto, use LDR to determine led high/low
-        //     else if(adc_mV >= 1000 && adc_mV < 2250){
-        //         // if LDR high mV (daylight) for 2s, turn off low beams, set lowbeam = 0
-        //         if (ldr_adc_mV > 2000 && lowbeam == 1){
-        //             vTaskDelay(MSG_DELAY/portTICK_PERIOD_MS);
-        //             if(ldr_adc_mV > 2000){
-        //                 gpio_set_level(HEADLIGHT_LED, 0);
-        //                 lowbeam = 0;
-        //             }
-        //         }
-                // if LDR low mV (dusk/night) for 1s, turn on low beams, set lowbeam = 1
-        //         else if (ldr_adc_mV < 1550 && lowbeam == 0){
-        //             vTaskDelay(1000 / portTICK_PERIOD_MS);
-        //             if (ldr_adc_mV < 1550){
-        //                 gpio_set_level(HEADLIGHT_LED, 1);
-        //                 lowbeam = 1;
-        //                 }
-                        
-        //             }
-        //         }
-        //     // if potentiometer set to on, turn on low beams, set lowbeam = 1
-        //     else if(adc_mV >= 2250){
-        //         gpio_set_level(HEADLIGHT_LED,1);
-        //         lowbeam = 1;
-        //     }
-                            
-        // }
-
-        // if executed = 4 (failed ignition) and ignition button is released
-        // if (ignition == false && executed == 4){
-        //     // reset to state after welcome message, testing for conditions
-        //     executed = 1;
-        // }
-
-        // // if ignition is successfully started and then ignition is released, set ignition_off = 1
-        // if (executed == 2 && ignition == false){
-        //     ignition_off = 1;
-        // }
-
-        // // if ignition_off = 1 and inition is pressed, turn off all LEDs
-        // if (ignition_off==1 && ignition == true){
-        //     engine_running = false;
-        //     gpio_set_level(SUCCESS_LED,0);          // turn off ignition
-        //     state = 0; // Reset wiper to park
-        //     duty = LEDC_DUTY_MIN;
-        //     stop_servo_motor();
-        //     executed = 3;                           // set executed = 3 to keep LEDs off
-        // } 
-        // last_ignition_button = ignition;
-
-        //** WINDSHIELD WIPER SUBSYSTEM **//
-        
-        // if (executed == 1) {
-            // // Determine delay time
-            // if (delayTimeSel_adc_bits < timeDelaySel1) {
-            //     INTtimeDelay = 1000; // SHORT
-            // } else if (delayTimeSel_adc_bits < timeDelaySel2) {
-            //     INTtimeDelay = 3000; // MEDIUM
-            // } else {
-            //     INTtimeDelay = 5000; // LONG
-            // }
-
-        //     // Determine mode (for display)
-        //     int old_mode = mode;
-        //     if (small_selected) {
-        //         mode = 0;
-        //     }
-        //     else if (medium_selected) {
-        //         mode = 1;
-        //     }
-        //     else {
-        //         mode = 2;
-        //     }
-        // }
-            // // Determine selected speed
-            // if (high_selected) {
-            //     requested_step = STEP_HIGH_SPEED;
-            // } else {
-            //     requested_step = STEP_LOW_SPEED;
-            // }
-
-            // States for wiper control
-            // int old_state = state;
-            // bool entering_new_state = false;
-            
-            // // Wipers parked at 0 degrees
-            // if (state == 0) {
-            //     // Only set position when first entering this state
-            //     if (old_state != 0) {
-            //         ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
-            //         ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-            //         entering_new_state = true;
-            //     }
-                
-            //     // Start moving if mode selected
-            //     if (int_selected) {
-            //         state = 1; // wait at 0 degrees
-            //         timeInterval = 0;
-            //         current_step = requested_step; // set requested speed
-            //     } else if (low_selected || high_selected) {
-            //         state = 2; // start moving up immediately
-            //         current_step = requested_step; // set speed
-            //     }
-            // }
-            
-            // // INT mode (waiting at 0 degrees for the selected delay time)
-            // else if (state == 1) {
-            //     timeInterval += 20;
-                
-            //     // Only set position when first entering wait state
-            //     if (old_state != 1) {
-            //         ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
-            //         ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-            //         entering_new_state = true;
-            //     }
-                
-            //     // Check if we should exit wait
-            //     if (off_selected) {
-            //         state = 0; // Stay parked
-            //     } else if (timeInterval >= INTtimeDelay) {
-            //         state = 2; // Start moving up
-            //     }
-            // }
-            
-    //         // Wipers moving up from 0 to 90 degrees
-    //         else if (state == 2) {
-    //             duty += current_step;
-    //             if (duty >= LEDC_DUTY_MAX) {
-    //                 duty = LEDC_DUTY_MAX;
-    //                 state = 3; // Start moving down
-    //             }
-    //             ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
-    //             ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    //         }
-            
-    //         // Wipers moving down from 90 to 0 degrees
-    //         else if (state == 3) {
-    //             duty -= current_step;
-    //             if (duty <= LEDC_DUTY_MIN) {
-    //                 duty = LEDC_DUTY_MIN;
-    //                 // Update speed for next cycle
-    //                 current_step = requested_step;
-    //                 // Determine next state based on mode
-    //                 if (off_selected) {
-    //                     state = 0; // reset wipers to park
-    //                 } else if (int_selected) {
-    //                     state = 1; // have wipers wait
-    //                     timeInterval = 0;
-    //                 } else {
-    //                     state = 2; // Continuous (LOW/HIGH)
-    //                 }
-    //             } else {
-    //                 ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, (int)duty);
-    //                 ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    //             }
-    //         }
-            
-    //     } else {
-    //         // Engine off, make sure wipers are parked
-    //         if (state != 0) {
-    //             state = 0;
-    //             duty = LEDC_DUTY_MIN;
-    //             stop_servo_motor();
-    //         }
-    //     }
-    // }
-// }

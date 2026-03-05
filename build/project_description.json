@@ -1,7 +1,7 @@
 {
     "version":            "1.3",
     "project_name":       "LCD_display_starter_code",
-    "project_version":    "8eb3573-dirty",
+    "project_version":    "3b55d5a-dirty",
     "project_path":       "/Users/miavatanapradit/esp/218 Final Project",
     "idf_path":           "/Users/miavatanapradit/esp/esp-idf",
     "build_dir":          "/Users/miavatanapradit/esp/218 Final Project/build",
