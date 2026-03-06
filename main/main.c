@@ -8,7 +8,6 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
-#include "stdio.h"
 #include "esp_adc/adc_cali.h"
 #include "freertos/timers.h"
 #include <string.h>
@@ -33,17 +32,15 @@
 // SERVO MOTOR config variables
 #define LEDC_TIMER              LEDC_TIMER_0
 #define LEDC_MODE               LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO          (7)
+#define LEDC_OUTPUT_IO          (12)
 #define LEDC_CHANNEL            LEDC_CHANNEL_0
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 #define LEDC_FREQUENCY          (50) // Frequency in Hertz. 50 Hz for a 20ms period.
-#define LEDC_DUTY_STOP           (240) // Set duty to 2.7% (0 deg angle position) (min pulse width)
-#define LEDC_DUTY_FWD           (270) // Set duty to spin forward
-        // Disk dispenser: 8 slices, each slice = 45 degrees
-        // 45 deg duty = LEDC_DUTY_MIN + (LEDC_DUTY_MAX - LEDC_DUTY_MIN) / 2 = 415
-#define SLICE_ROTATE_MS         (500) // 
-#define SLICE_SETTLE_MS         (300) // 
-#define TOTAL_FOOD_SLICES       (7)
+#define LEDC_DUTY_MIN           (615) // Set duty to 2.7% (0 deg angle position) (min pulse width)
+#define LEDC_DUTY_MAX           (700) // Set duty to spin forward
+    // Disk dispenser: 8 slices, each slice = 45 degrees
+#define SLICE_ROTATE_MS         (160) // ms to rotate 45 degrees
+#define SLICE_SETTLE_MS         (2000) // ms to wait for food to fall through
 
 // Keypad variables
 #define LOOP_DELAY_MS           10      // Loop sampling time (ms)
@@ -54,14 +51,14 @@
 #define NOPRESS                 '\0'    // NOPRESS character
 
 // Feeding schedule/refill defines
-#define SMALL_MAX            1365       // ADC < 1365  → SMALL
-#define MEDIUM_MAX           2730       // ADC < 2730  → MEDIUM, >= 2730 → LARGE
-#define REFILL_THRESHOLD     7         // total rotations before refill LED triggers
-#define MAX_DIGITS           2          // max digits for feedings-per-day entry
+#define SMALL_MAX            1000       // ADC < 1000
+#define MEDIUM_MAX           2250       // ADC < 2250, >= 2250 is LARGE portion
+#define REFILL_THRESHOLD     7          // total rotations before refill LED triggers
+#define MAX_DIGITS           4          // max digits for feedings-per-day entry
 
 // Initialize keypad rows, columns, layout
-int row_pins[] = {GPIO_NUM_14, GPIO_NUM_13, GPIO_NUM_12, GPIO_NUM_11};     // Pin numbers for rows
-int col_pins[] = {GPIO_NUM_10, GPIO_NUM_9, GPIO_NUM_46, GPIO_NUM_3};   // Pin numbers for columns
+int row_pins[] = {GPIO_NUM_10, GPIO_NUM_9, GPIO_NUM_46, GPIO_NUM_3};     // Pin numbers for rows
+int col_pins[] = {GPIO_NUM_8, GPIO_NUM_18, GPIO_NUM_17, GPIO_NUM_16};   // Pin numbers for columns
 char keypad_array[NROWS][NCOLS] = {   // Keypad layout
     {'1', '2', '3', 'A'},
     {'4', '5', '6', 'B'},
@@ -79,7 +76,6 @@ int on_led = 0;
 // Portion Selection globals
 bool small_selected = false;
 bool medium_selected = false;
-bool large_selected = false;
 int mode = 0;           // Current mode: 0=SMALL, 1=MEDIUM, 2=LARGE
 
 // Feeding Schedule globals
@@ -88,37 +84,32 @@ int slice_count = 0; // total rotations since last refill
 int feed_hour = 0;   // feed hour inputted on keypad (0-23)
 int feed_minute = 0; // feed minute inputted on keypad (0-59)
 int seconds_until_feed = 0; // current countdown value
+bool invalid_time = false; // flag for when user enters invalid time format on keypad
+bool time_passed = false; // flag for when current time has passed scheduled feed time  
+bool countdown_cancelled = false; // flag for when user cancels countdown by changing feed time or turning off
+bool low_food_warning = false; // flag for when user selects portion size that exceeds remaining food, triggers warning on LCD
 
 // Keypad input buffer
-char keypad_buf[MAX_DIGITS + 1];
-int digit_count = 0;
+char keypad_buf[MAX_DIGITS + 1]; // buffer to hold the digits as they are entered, plus null terminator
+int digit_count = 0; // count of how many digits have been entered so far, used to manage buffer and formatting
 
 // LCD global handling
 hd44780_t lcd_display;
 
 // Stop the servo motor at 0 degrees
 void stop_servo_motor(void) {
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_STOP);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MIN);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
 }
 
 // Rotate disk 45 degrees to dispense one slice of food, then stop and wait for food to fall using delay
 void dispense_one_slice(void) {
     // Move to 45 deg (one slice forward)
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_FWD);
+    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_MAX);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
     vTaskDelay(SLICE_ROTATE_MS / portTICK_PERIOD_MS);   // wait for food to fall through
     stop_servo_motor();
     vTaskDelay(SLICE_SETTLE_MS / portTICK_PERIOD_MS);
-}
-
-// After all 7 slices are used, rotate another 45 degrees to return to starting position
-void return_to_home(void) {
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_FWD);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    vTaskDelay(SLICE_ROTATE_MS / portTICK_PERIOD_MS);
-    stop_servo_motor();
-    printf("Disk returned to starting position. \n"); // print debugger to verify
 }
 
 // LCD Task
@@ -154,18 +145,24 @@ void lcd_task(void *pvParameters)
         }
             
         if (executed == 1) {
-            hd44780_gotoxy(&lcd_display, 0, 0);
-            hd44780_puts(&lcd_display, "Portion Size:");
-            // Show the current mode on second line
-            hd44780_gotoxy(&lcd_display, 0, 1);
-            if (mode == 0) {
-                hd44780_puts(&lcd_display, "SMALL");
-            }
-            else if (mode == 1) {
-                hd44780_puts(&lcd_display, "MEDIUM");
-            }
-            else {
-                hd44780_puts(&lcd_display, "LARGE");
+            if (low_food_warning) {
+                // Show low food warning if user has selected a portion size that exceeds remaining slices
+                hd44780_gotoxy(&lcd_display, 0, 0);
+                hd44780_puts(&lcd_display, "Not enough food!");
+                hd44780_gotoxy(&lcd_display, 0, 1);
+                hd44780_puts(&lcd_display, "REFILL or RESIZE");
+            } else {
+                hd44780_gotoxy(&lcd_display, 0, 0);
+                hd44780_puts(&lcd_display, "Portion Size:");
+                // Show the current mode on second line
+                hd44780_gotoxy(&lcd_display, 0, 1);
+                if (mode == 0) {
+                    hd44780_puts(&lcd_display, "SMALL");
+                } else if (mode == 1) {
+                    hd44780_puts(&lcd_display, "MEDIUM");
+                } else {
+                    hd44780_puts(&lcd_display, "LARGE");
+                }
             }
         }
 
@@ -174,15 +171,20 @@ void lcd_task(void *pvParameters)
             hd44780_gotoxy(&lcd_display, 0, 0);
             hd44780_puts(&lcd_display, "Feed time (HHMM)");
             hd44780_gotoxy(&lcd_display, 0, 1);
-            // Format typed digits as HH:MM with cursor
-            char formatted[17]; // buffer for formatted string
-            if (digit_count <= 2) { // only hours entered so far, show as HH_
-                snprintf(formatted, sizeof(formatted), "%s_", keypad_buf); // append underscore cursor to end of input
+            if (invalid_time) {
+                hd44780_puts(&lcd_display, "Invalid time!");
+            } else if (time_passed) {
+                hd44780_puts(&lcd_display, "Time passed!");
             } else {
-                snprintf(formatted, sizeof(formatted), "%.2s:%.2s_", // format first two digits as hours, next two as minutes, append underscore cursor
+                char formatted[17]; // buffer for formatted string
+                if (digit_count <= 2) { // only hours entered so far, show as HH_
+                    snprintf(formatted, sizeof(formatted), "%s_", keypad_buf); // append underscore cursor to end of input
+                } else {
+                    snprintf(formatted, sizeof(formatted), "%.2s:%.2s_", // format first two digits as hours, next two as minutes, append underscore cursor
                          keypad_buf, keypad_buf + 2); // point to same buffer but offset by 2 to get minutes portion
+                }
+                hd44780_puts(&lcd_display, formatted); // display formatted input on LCD
             }
-            hd44780_puts(&lcd_display, formatted); // display formatted input on LCD
         }
 
         if (executed == 3) {
@@ -195,27 +197,10 @@ void lcd_task(void *pvParameters)
             hd44780_puts(&lcd_display, line2);
         }
 
-        if (executed == 6) {
-            // Low food warning
-            int slices_remaining = REFILL_THRESHOLD - slice_count;
-            hd44780_gotoxy(&lcd_display, 0, 0);
-            hd44780_puts(&lcd_display, "Low food!");
-            // hd44780_gotoxy(&lcd_display, 0, 1);
-            // snprintf(line2, sizeof(line2), "%d left, need %d", slices_remaining, slices);
-            // hd44780_puts(&lcd_display, line2);
-        }
-
         if (executed == 4) {
             // Dispensing — show partial warning if not enough slices
-            int slices_remaining = REFILL_THRESHOLD - slice_count;
             hd44780_gotoxy(&lcd_display, 0, 0);
             hd44780_puts(&lcd_display, "Dispensing...");
-            hd44780_gotoxy(&lcd_display, 0, 1);
-            if (slices_remaining < slices && slices_remaining > 0) {
-                hd44780_puts(&lcd_display, "Partial portion!");
-            } else {
-                hd44780_puts(&lcd_display, "");
-            }
         }
 
         if (executed == 5) {
@@ -250,7 +235,7 @@ static void ledc_init(void)
         .timer_sel      = LEDC_TIMER,
         .intr_type      = LEDC_INTR_DISABLE,
         .gpio_num       = LEDC_OUTPUT_IO,
-        .duty           = 0,
+        .duty           = LEDC_DUTY_MIN,
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
@@ -295,6 +280,10 @@ char scan_keypad() {
 
 void app_main(void)
 {
+    // SERVO MOTOR initialization //
+    ledc_init(); // Initialize servo motor
+    stop_servo_motor(); // Start with motor stopped
+
     // Configure GPIO pins
     // set on button config to input and internal pullup
     gpio_reset_pin(ON_BUTTON);
@@ -319,14 +308,9 @@ void app_main(void)
     gpio_reset_pin(REFILL_LED);
     gpio_set_direction(REFILL_LED, GPIO_MODE_OUTPUT);
     
-    // SERVO MOTOR initialization //
-    ledc_init(); // Initialize servo motor
-    stop_servo_motor(); // Start with motor stopped
-    
     // POTENTIOMETER initialization (ADC) //
     // Initialize ADC
     int PORTION_SEL_adc_bits;
-    int loop_count = 0;
 
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
@@ -351,9 +335,9 @@ void app_main(void)
     t.tm_year = 125;    // years since 1900 (2025)
     t.tm_mon  = 2;      // month (0-indexed, 2 = March)
     t.tm_mday = 5;      // day of month
-    t.tm_hour = 15;     // !! SET THIS to current hour (24hr format) !!
-    t.tm_min  = 59;     // !! SET THIS to current minute !!
-    t.tm_sec  = 0;
+    t.tm_hour = 19;     // !! SET THIS to current hour (24hr format) !!
+    t.tm_min  = 47;     // !! SET THIS to current minute !!
+    t.tm_sec  = 30;
     demo_time.tv_sec = mktime(&t);
     settimeofday(&demo_time, NULL);
 
@@ -365,7 +349,7 @@ void app_main(void)
     char new_key = NOPRESS;         // key currently pressed
     char last_key = NOPRESS;        // last key pressed
     char confirmed_key = NOPRESS;   // set only on the cycle a keypress is confirmed 
-    int time = 0;                   // time debounce delay verify
+    int debounce_time = 0;                   // time debounce delay verify
     bool timed_out = false;         // checks if key pressed lasts longer than debounce time
     
     // clear keypad buffer
@@ -373,8 +357,7 @@ void app_main(void)
 
     while (1)
     {
-        vTaskDelay(20 / portTICK_PERIOD_MS);
-        loop_count++;
+        vTaskDelay(LOOP_DELAY_MS / portTICK_PERIOD_MS);
 
         // Read ADC values
         adc_oneshot_read(adc1_handle, PORTION_SEL, &PORTION_SEL_adc_bits);            // Read ADC bits (mode potentiometer)
@@ -387,18 +370,17 @@ void app_main(void)
         // Determine wiper mode selection
         small_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < SMALL_MAX);
         medium_selected = (PORTION_SEL_adc_bits >= SMALL_MAX && PORTION_SEL_adc_bits < MEDIUM_MAX);
-        large_selected = (PORTION_SEL_adc_bits >= MEDIUM_MAX);
 
         //** FSM FOR KEYPAD **//
         // update FSM inputs
-        confirmed_key = NOPRESS;
+        confirmed_key = NOPRESS;                    // reset confirmed key each cycle, happens only once per key press
         new_key = scan_keypad();                    // assign each new key press as the key that is returned from scan_keypad function 
-        timed_out = (time >= DEBOUNCE_TIME);        // checks if key pressed lasts longer than debounce time 
+        timed_out = (debounce_time >= DEBOUNCE_TIME);        // checks if key pressed lasts longer than debounce time 
 
         switch (state) {
             case Wait_for_press:
                 if (new_key != NOPRESS) {           // if a key is pressed, set time = 0 and assign as new key pressed
-                    time = 0;                       // reset debounce time delay incrementer
+                    debounce_time = 0;                       // reset debounce time delay incrementer
                     last_key = new_key;             // set new key pressed
                     state = Debounce;               // transition to next state
                 } else {
@@ -410,12 +392,14 @@ void app_main(void)
                 if (timed_out) {                                // if the debounce time of 40 ms has passed and key pressed remains same, 
                     if (new_key == last_key) {                  // confirm valid key press
                         confirmed_key = last_key;               // mark key as confirmed for this cycle
+                        last_key = NOPRESS;                     // reset last key to avoid multiple confirmations from one long press
                         state = Wait_for_release;               // transition to next state
+                        printf("Key '%c' confirmed.\n", confirmed_key); // print confirmed key for debugging
                     } else {                                    // or else, if the key changed during debounce delay (glitch), 
                         state = Wait_for_press;                 // go back to initial state
                     }
                 } else {                                        // else, keep incrementing counter until at 40 ms (debounce time), stay in state
-                    time += LOOP_DELAY_MS;                      // add 10 ms to time
+                    debounce_time += LOOP_DELAY_MS;                      // add 10 ms to debounce time
                 }
                 break;
 
@@ -427,6 +411,7 @@ void app_main(void)
                 }
                 break;
         }
+        
 
         //** SELECTION PROCESS SUBSYSTEM **//
 
@@ -453,34 +438,82 @@ void app_main(void)
                 mode = 2; // LARGE
             }
 
+            // clear low food warning as soon as current pot position fits remaining slices
+            if (low_food_warning) {
+                int slices_remaining = REFILL_THRESHOLD - slice_count;
+                int current_slices = mode + 1;
+                if (current_slices <= slices_remaining) {
+                    low_food_warning = false;  // safe to proceed, warning clears automatically
+                }
+            }
+
+            // allow refill button to clear low food warning and trigger refill state
+            if (refill && low_food_warning) {
+                low_food_warning = false;
+                slices = 0;
+                slice_count = 0;
+                gpio_set_level(REFILL_LED, 0);
+                printf("Refill acknowledged from low food warning.\n");
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                // stay on executed == 1, user can now pick any portion size
+            }
+
             // Lock in portion when SELECT button is pressed
             if (select_portion) {
-                slices = mode + 1;      // SMALL=1 slice, MEDIUM=2 slices, LARGE=3 slices
-                printf("Portion selected: %s (%d slice(s))\n",
-                    mode == 0 ? "SMALL" : mode == 1 ? "MEDIUM" : "LARGE", slices);
-                memset(keypad_buf, 0, sizeof(keypad_buf));
-                digit_count = 0;
-                vTaskDelay(300 / portTICK_PERIOD_MS);   // brief delay to avoid button bounce
-                executed = 2;
+                slices = mode + 1;
+                int slices_remaining = REFILL_THRESHOLD - slice_count;
+
+                // warn user if not enough food for selected portion
+                if (slices > slices_remaining) {
+                    printf("Low food warning: %d slices needed, %d remaining.\n", slices, slices_remaining);
+                    low_food_warning = true;
+                    slices = 0; // reset slices to 0 to prevent accidental dispensing if user tries to proceed without changing portion size or refilling
+                } else {
+                    low_food_warning = false;
+                    // enough food — proceed normally
+                    memset(keypad_buf, 0, sizeof(keypad_buf));
+                    digit_count  = 0;
+                    invalid_time = false;
+                    time_passed = false;
+                    vTaskDelay(300 / portTICK_PERIOD_MS);
+                    executed = 2;
+                }
+            }
+            // handle refill button in portion select
+            if (refill && low_food_warning) {
+                slice_count = 0;
+                low_food_warning = false;
+                gpio_set_level(REFILL_LED, 0);
+                vTaskDelay(300 / portTICK_PERIOD_MS);
             }
         }
 
-        // enter feeding time in military time (HHMM) on keypad and then confirm with select button
+        // enter feeding time as HHMM via keypad, confirm with SELECT
+        // first digit must be 0, 1, or 2; letters ignored; * = backspace
+        // if hours > 23 or minutes > 59, show error on LCD and reset input
         if (executed == 2) {
             if (confirmed_key != NOPRESS) {
                 if (confirmed_key >= '0' && confirmed_key <= '9' && digit_count < MAX_DIGITS) {
-                    // append digit to buffer
-                    keypad_buf[digit_count] = confirmed_key;
-                    digit_count++;
-                    keypad_buf[digit_count] = '\0';
-                    printf("Time input so far: %s\n", keypad_buf);
-
+                    // validate first digit — must be 0, 1, or 2 for a valid 24hr hour
+                    if (digit_count == 0 && confirmed_key > '2') {
+                        printf("Invalid first digit '%c'. Hour must start with 0, 1, or 2.\n", confirmed_key);
+                    } else {
+                        keypad_buf[digit_count] = confirmed_key;    // append digit to buffer
+                        digit_count++;
+                        keypad_buf[digit_count] = '\0';
+                        invalid_time = false;
+                        time_passed = false;
+                        printf("Time input so far: %s\n", keypad_buf);
+                    }
                 } else if (confirmed_key == '*' && digit_count > 0) {
                     // backspace: remove last digit
                     digit_count--;
                     keypad_buf[digit_count] = '\0';
+                    invalid_time = false;
+                    time_passed = false;
                     printf("Backspace. Input now: %s\n", keypad_buf);
                 }
+                // all other keys (A, B, C, D, #) are silently ignored
             }
             
             // press select button to confirm the 4 digit time entry
@@ -491,130 +524,130 @@ void app_main(void)
                 feed_hour   = atoi(hh);
                 feed_minute = atoi(mm);
 
-                // validate range
-                if (feed_hour > 23) feed_hour = 23;
-                if (feed_minute > 59) feed_minute = 59;
+                // validate range — if invalid, show error on LCD and reset so user can re-enter
+                if (feed_hour > 23 || feed_minute > 59) {
+                    printf("Invalid time %02d:%02d. Please re-enter.\n", feed_hour, feed_minute);
+                    invalid_time = true;
+                    time_passed = false;
+                    memset(keypad_buf, 0, sizeof(keypad_buf));
+                    digit_count = 0;
+                    feed_hour   = 0;
+                    feed_minute = 0;
+                    vTaskDelay(MSG_DELAY / portTICK_PERIOD_MS);
+                    invalid_time = false;
+                } else {
+                    // valid time — calculate seconds until target
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    struct tm *now = localtime(&tv.tv_sec);
 
-                // get current time and calculate seconds until target
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                struct tm *now = localtime(&tv.tv_sec);
+                    int current_seconds = now->tm_hour * 3600 + now->tm_min * 60 + now->tm_sec;
+                    int target_seconds  = feed_hour * 3600 + feed_minute * 60;
 
-                int current_seconds = now->tm_hour * 3600 + now->tm_min * 60 + now->tm_sec;
-                int target_seconds  = feed_hour * 3600 + feed_minute * 60;
-
-                // if target is earlier in the day than now, schedule for tomorrow
-                if (target_seconds <= current_seconds) {
-                    target_seconds += 24 * 3600;
-                }
-
-                seconds_until_feed = target_seconds - current_seconds;
-                printf("Feed scheduled for %02d:%02d. Countdown: %d seconds.\n",
-                       feed_hour, feed_minute, seconds_until_feed);
-                vTaskDelay(300 / portTICK_PERIOD_MS);   // brief delay to avoid button bounce
-                executed = 3;
-            }
-        }
-
-        // executed == 3: countdown to next feeding (non-blocking, 100 cycles of 10ms = 1 second)
-        if (executed == 3) {
-            static int cycle_count = 0;
-            cycle_count++;
-            if (cycle_count >= 100) {
-                cycle_count = 0;
-                if (seconds_until_feed > 0) {
-                    seconds_until_feed--;
-                }
-                if (seconds_until_feed <= 0) {
-                    // check if enough slices before dispensing
-                    int slices_remaining = REFILL_THRESHOLD - slice_count;
-                    if (slices_remaining < slices) {
-                        executed = 6;   // not enough — show warning first
+                    // if target is earlier in the day than now, schedule for tomorrow
+                    if (target_seconds <= current_seconds) {
+                        // time already passed — show error and reset
+                        printf("Time %02d:%02d already passed. Please re-enter.\n", feed_hour, feed_minute);
+                        time_passed = true;
+                        invalid_time = false;
+                        memset(keypad_buf, 0, sizeof(keypad_buf));
+                        digit_count = 0;
+                        feed_hour   = 0;
+                        feed_minute = 0;
+                        vTaskDelay(MSG_DELAY / portTICK_PERIOD_MS);
+                        time_passed = false;
                     } else {
-                        executed = 4;   // enough slices — dispense normally
+                        // valid future time — start countdown
+                        seconds_until_feed = target_seconds - current_seconds;
+                        printf("Feed scheduled for %02d:%02d. Countdown: %d seconds.\n",
+                               feed_hour, feed_minute, seconds_until_feed);
+                        vTaskDelay(300 / portTICK_PERIOD_MS);   // brief delay to avoid button bounce
+                        executed = 3;
                     }
                 }
             }
         }
 
-        // executed == 6: low food warning — not enough slices for the selected portion
-        //               SELECT to dispense what's left anyway, REFILL to cancel and refill first
-        if (executed == 6) {
-            if (select_portion) {
-                // user accepts partial portion — proceed to dispense
-                vTaskDelay(300 / portTICK_PERIOD_MS);
-                executed = 4;
+        // executed == 3: countdown to next feeding (non-blocking, 100 cycles of 10ms = 1 second)
+        if (executed == 3) {
+            if (confirmed_key == '#') {
+                printf("Countdown cancelled by user.\n");
+                countdown_cancelled = true;
+                seconds_until_feed = 0;
+                invalid_time = false;
+                time_passed = false;
+                memset(keypad_buf, 0, sizeof(keypad_buf));
+                digit_count = 0;
+                feed_hour   = 0;
+                feed_minute = 0;
+                slices = 0;
+                executed = 1; // go back to portion select
+                continue; // skip the rest of the countdown logic this cycle
             }
-            if (refill) {
-                // user wants to refill first — go straight to refill alert
-                vTaskDelay(300 / portTICK_PERIOD_MS);
-                return_to_home();
-                gpio_set_level(REFILL_LED, 1);
-                executed = 5;
+
+            static time_t last_tick = 0;
+            struct timeval tv_now;
+            gettimeofday(&tv_now, NULL);
+            time_t now_sec = tv_now.tv_sec;
+            if (last_tick == 0) {
+                last_tick = now_sec;
+            }
+            
+            // decrement once per real second
+            if (now_sec > last_tick) {
+                int elapsed = (int)(now_sec - last_tick);
+                last_tick = now_sec;
+                seconds_until_feed -= elapsed;
+                if (seconds_until_feed < 0) seconds_until_feed = 0;
+            }
+
+            if (seconds_until_feed <= 0) {
+                last_tick = 0;  // reset for next time we enter state 3
+                int slices_remaining = REFILL_THRESHOLD - slice_count;
+                printf("Countdown done. slices_remaining=%d, slices=%d\n", slices_remaining, slices);  // add this
+                if (slices_remaining < slices) {
+                    executed = 5; // not enough food, go to refill alert
+                } else {
+                    executed = 4;
+                }
             }
         }
 
         // executed == 4: dispense food
         if (executed == 4) {
-            int slices_remaining = REFILL_THRESHOLD - slice_count;  // how many slices are left
-
-            if (slices_remaining <= 0) {
-                // no slices left at all — skip dispensing, go straight to refill alert
-                printf("No slices remaining. Refill needed!\n");
-                return_to_home();
-                gpio_set_level(REFILL_LED, 1);
-                executed = 5;
-
-            } else if (slices_remaining < slices) {
-                // not enough slices for the full portion — dispense what is left
-                printf("Only %d slice(s) left, dispensing partial portion.\n", slices_remaining);
-                for (int i = 0; i < slices_remaining; i++) {
-                    dispense_one_slice();
-                    slice_count++;
-                }
-                printf("Partial portion dispensed. Refill needed!\n");
-                return_to_home();
-                gpio_set_level(REFILL_LED, 1);
-                executed = 5;
-
-            } else {
-                // enough slices for the full portion — dispense normally
-                printf("Dispensing %d slice(s)...\n", slices);
-                for (int i = 0; i < slices; i++) {
-                    dispense_one_slice();
-                    slice_count++;
-                }
+            printf("Dispensing %d slice(s)...\n", slices);
+            for (int i = 0; i < slices; i++) {
+                dispense_one_slice();
+                slice_count++;
                 printf("Dispensed. Total slices since refill: %d\n", slice_count);
+            }
 
-                if (slice_count >= REFILL_THRESHOLD) {
-                    // all 7 slices used — return to home and trigger refill
-                    return_to_home();
-                    gpio_set_level(REFILL_LED, 1);
-                    printf("Refill needed!\n");
-                    executed = 5;
-                } else {
-                    // schedule next feeding for same time tomorrow
-                    seconds_until_feed = 24 * 3600;
-                    printf("Next feed at %02d:%02d tomorrow. Countdown: %d seconds.\n",
-                           feed_hour, feed_minute, seconds_until_feed);
-                    executed = 3;
-                }
+            if (slice_count >= REFILL_THRESHOLD) {
+                dispense_one_slice();   // return disk to home
+                gpio_set_level(REFILL_LED, 1);
+                printf("Refill needed!\n");
+                executed = 5;
+            } else {
+                slices = 0; // reset slices after dispensing
+                executed = 1;   // go back to portion select
             }
         }
 
         // executed == 5: refill alert — wait for refill button
         if (executed == 5) {
+            printf("In executed==5, refill=%d, slice_count=%d\n", refill, slice_count); // debug statement
             if (refill) {
                 slice_count = 0;
+                slices = 0;
+                low_food_warning = false;
                 gpio_set_level(REFILL_LED, 0);
-                printf("Refill acknowledged. Resuming schedule.\n");
+                feed_hour = 0;   // reset feed hour
+                feed_minute = 0; // reset feed minute
+                printf("Refill set!\n");
                 vTaskDelay(300 / portTICK_PERIOD_MS);
-                seconds_until_feed = 24 * 3600;  // resume — next feed same time tomorrow
-                executed = 3;
+                executed = 1;
             }
         }
-        vTaskDelay(DELAY_MS/portTICK_PERIOD_MS);
     }
-}
-        
+}     
 
