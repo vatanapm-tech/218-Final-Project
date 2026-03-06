@@ -13,5 +13,6 @@
     "--compile-commands-dir=c:\\ESP32\\ESP32_Exercises\\LCD_display\\default\\build"
   ],
   "idf.currentSetup": "/Users/miavatanapradit/esp/esp-idf",
-  "idf.port": "/dev/tty.usbmodem1101"
+  "idf.port": "/dev/tty.usbmodem1101",
+  "idf.monitorPort": "/dev/tty.usbmodem1101"
 }
