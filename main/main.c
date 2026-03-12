@@ -37,9 +37,9 @@
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
 #define LEDC_FREQUENCY          (50) // Frequency in Hertz. 50 Hz for a 20ms period.
 #define LEDC_DUTY_MIN           (615) // Set duty to 2.7% (0 deg angle position) (min pulse width)
-#define LEDC_DUTY_MAX           (700) // Set duty to spin forward
+#define LEDC_DUTY_MAX           (590) // Set duty to spin forward
     // Disk dispenser: 8 slices, each slice = 45 degrees
-#define SLICE_ROTATE_MS         (160) // ms to rotate 45 degrees
+#define SLICE_ROTATE_MS         (590) // ms to rotate 45 degrees
 #define SLICE_SETTLE_MS         (2000) // ms to wait for food to fall through
 
 // Keypad variables
@@ -51,8 +51,8 @@
 #define NOPRESS                 '\0'    // NOPRESS character
 
 // Feeding schedule/refill defines
-#define SMALL_MAX            1000       // ADC < 1000
-#define MEDIUM_MAX           2250       // ADC < 2250, >= 2250 is LARGE portion
+#define LARGE_MAX            1000       // ADC < 1000
+#define MEDIUM_MAX           2250       // ADC < 2250, >= 2250 is SMALL portion
 #define REFILL_THRESHOLD     7          // total rotations before refill LED triggers
 #define MAX_DIGITS           4          // max digits for feedings-per-day entry
 
@@ -74,9 +74,9 @@ int executed = 0;
 int on_led = 0;
 
 // Portion Selection globals
-bool small_selected = false;
+bool large_selected = false;
 bool medium_selected = false;
-int mode = 0;           // Current mode: 0=SMALL, 1=MEDIUM, 2=LARGE
+int mode = 0;           // Current mode: 0=LARGE, 1=MEDIUM, 2=SMALL
 
 // Feeding Schedule globals
 int slices = 0; // rotations to perform this dispense (1,2,3)
@@ -157,11 +157,11 @@ void lcd_task(void *pvParameters)
                 // Show the current mode on second line
                 hd44780_gotoxy(&lcd_display, 0, 1);
                 if (mode == 0) {
-                    hd44780_puts(&lcd_display, "SMALL");
+                    hd44780_puts(&lcd_display, "LARGE");
                 } else if (mode == 1) {
                     hd44780_puts(&lcd_display, "MEDIUM");
                 } else {
-                    hd44780_puts(&lcd_display, "LARGE");
+                    hd44780_puts(&lcd_display, "SMALL");
                 }
             }
         }
@@ -248,7 +248,7 @@ typedef enum {
     Wait_for_release,
 } State_t;
 
-void init_keypad() {
+void init_keypad() { // function to initialize keypad GPIO pins and states
     // initialize row pins as outputs and set to inactive state
     for (int i = 0; i < NROWS; i++) {                           // incrementer to count through rows
         gpio_set_direction(row_pins[i], GPIO_MODE_OUTPUT);      // set as output
@@ -262,7 +262,7 @@ void init_keypad() {
     }
 }
 
-char scan_keypad() {
+char scan_keypad() { // function to scan keypad and return key being pressed, or NOPRESS if no key is pressed
     char new_key = NOPRESS;                     // declare variable to hold key that the function returns
 
     for (int i = 0; i < NROWS; i++) {           // scan each row, setting one row active at a time and then check each column to see if active
@@ -334,10 +334,10 @@ void app_main(void)
     struct tm t = {0};
     t.tm_year = 125;    // years since 1900 (2025)
     t.tm_mon  = 2;      // month (0-indexed, 2 = March)
-    t.tm_mday = 5;      // day of month
-    t.tm_hour = 19;     // !! SET THIS to current hour (24hr format) !!
-    t.tm_min  = 47;     // !! SET THIS to current minute !!
-    t.tm_sec  = 30;
+    t.tm_mday = 10;     // day of month
+    t.tm_hour = 12;     // !! SET TO CURRENT HOUR (24 hrs) !!
+    t.tm_min  = 35;     // !! SET TO CURRENT MINUTE !!
+    t.tm_sec  = 0;
     demo_time.tv_sec = mktime(&t);
     settimeofday(&demo_time, NULL);
 
@@ -349,7 +349,7 @@ void app_main(void)
     char new_key = NOPRESS;         // key currently pressed
     char last_key = NOPRESS;        // last key pressed
     char confirmed_key = NOPRESS;   // set only on the cycle a keypress is confirmed 
-    int debounce_time = 0;                   // time debounce delay verify
+    int debounce_time = 0;          // time debounce delay verify
     bool timed_out = false;         // checks if key pressed lasts longer than debounce time
     
     // clear keypad buffer
@@ -367,9 +367,9 @@ void app_main(void)
         select_portion = gpio_get_level(SELECT_BUTTON) == 0;
         refill = gpio_get_level(REFILL_BUTTON) == 0;
 
-        // Determine wiper mode selection
-        small_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < SMALL_MAX);
-        medium_selected = (PORTION_SEL_adc_bits >= SMALL_MAX && PORTION_SEL_adc_bits < MEDIUM_MAX);
+        // Determine portion size selection
+        large_selected = (PORTION_SEL_adc_bits >= 0 && PORTION_SEL_adc_bits < LARGE_MAX);
+        medium_selected = (PORTION_SEL_adc_bits >= LARGE_MAX && PORTION_SEL_adc_bits < MEDIUM_MAX);
 
         //** FSM FOR KEYPAD **//
         // update FSM inputs
@@ -424,28 +424,42 @@ void app_main(void)
                 vTaskDelay(MSG_DELAY / portTICK_PERIOD_MS);
                 executed = 1;       // set executed = 1 so welcome message only prints once
                 vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
+            } else if (on_led == 1) {
+                // press again — turn off
+                gpio_set_level(ON_LED, 0);
+                on_led = 0;
+                executed = 0;
+                slice_count = 0;
+                slices = 0;
+                low_food_warning = false;
+                seconds_until_feed = 0;
+                feed_hour = 0;
+                feed_minute = 0;
+                memset(keypad_buf, 0, sizeof(keypad_buf));
+                digit_count = 0;
+                printf("System off.\n");
+                vTaskDelay(300 / portTICK_PERIOD_MS);
             }
         }
 
         // portion selection
         if (executed == 1) {
             // update mode on potentiometer
-            if (small_selected) {
-                mode = 0; // SHORT
+            if (large_selected) {
+                mode = 0; // LARGE
             } else if (medium_selected) {
                 mode = 1; // MEDIUM
             } else {
-                mode = 2; // LARGE
+                mode = 2; // SMALL
             }
 
-            // clear low food warning as soon as current pot position fits remaining slices
-            if (low_food_warning) {
-                int slices_remaining = REFILL_THRESHOLD - slice_count;
-                int current_slices = mode + 1;
-                if (current_slices <= slices_remaining) {
-                    low_food_warning = false;  // safe to proceed, warning clears automatically
+            static int last_mode = -1;
+                if (mode != last_mode) {
+                    low_food_warning = false;
+                    last_mode = mode;
                 }
-            }
+                last_mode = mode;
+            
 
             // allow refill button to clear low food warning and trigger refill state
             if (refill && low_food_warning) {
@@ -460,7 +474,7 @@ void app_main(void)
 
             // Lock in portion when SELECT button is pressed
             if (select_portion) {
-                slices = mode + 1;
+                slices = 3 - mode;
                 int slices_remaining = REFILL_THRESHOLD - slice_count;
 
                 // warn user if not enough food for selected portion
@@ -478,13 +492,6 @@ void app_main(void)
                     vTaskDelay(300 / portTICK_PERIOD_MS);
                     executed = 2;
                 }
-            }
-            // handle refill button in portion select
-            if (refill && low_food_warning) {
-                slice_count = 0;
-                low_food_warning = false;
-                gpio_set_level(REFILL_LED, 0);
-                vTaskDelay(300 / portTICK_PERIOD_MS);
             }
         }
 
@@ -648,6 +655,5 @@ void app_main(void)
                 executed = 1;
             }
         }
-    }
-}     
-
+    }     
+}
