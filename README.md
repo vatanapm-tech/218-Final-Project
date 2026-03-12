@@ -1,11 +1,4 @@
-## What the example does
-
-* Initializes the driver
-* Uploads custom characters
-* Displays "Hello world!"
-* Displays the custom characters
-* Displays the current sec in a loop
-
-## Wiring
-
-Please see the source code for pins and connections.
+## ECE-218 Final Project: Automatic Pet Feeder
+Team members: Mia Vatanapradit
+### System Behavior
+This project is an automatic pet feeder that allows the user to select portion sizes and schedule feeding times. The system is powered by pressing an ON button that toggles the device on and off. After the system is powered on, a potentiometer knob allows the user to select a portion size: Small, Medium, or Large; with the current selection displayed on an LCD display in real time. Once the portion is confirmed with the SELECT button, the system checks whether enough food remains; if not, the user is prompted to refill the feeder or choose a smaller portion. The warning clears automatically if the knob is adjusted to a valid smaller portion, or the user can press the REFILL button to reset the food supply. After a valid portion is selected, the user enters a feeding time in a 24-hour HHMM format using a 4x4 matrix keypad, with the ability to select backspace using the ‘*’ key. The system rejects times that have already passed or contain invalid hour or minute values, and validates the input when the user presses the SELECT button again. Once it validates, it begins a countdown to the scheduled feeding time, displaying the remaining time in seconds on the LCD, which can be cancelled by clicking the ‘#’ button on the keypad. Doing so returns the system to the portion selection stage without activating the motor. When the countdown reaches zero, a servo motor rotates a slotted disk holding the pet food in 45-degree increments to dispense the selected portion size; one 45-degree rotation for the small portion, two for the medium portion, and three for the large portion. The system tracks the total number of food slots dispensed since the last refill, and if the refill threshold is reached, a red LED and LCD message prompt the user to replenish the food supply. Pressing the REFILL button resets the food slot counter and prepares the system for the next feeding cycle.
