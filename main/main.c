@@ -39,7 +39,7 @@
 #define LEDC_DUTY_MIN           (615) // Set duty to 2.7% (0 deg angle position) (min pulse width)
 #define LEDC_DUTY_MAX           (590) // Set duty to spin forward
     // Disk dispenser: 8 slices, each slice = 45 degrees
-#define SLICE_ROTATE_MS         (590) // ms to rotate 45 degrees
+#define SLICE_ROTATE_MS         (900) // ms to rotate 45 degrees
 #define SLICE_SETTLE_MS         (2000) // ms to wait for food to fall through
 
 // Keypad variables
@@ -85,6 +85,7 @@ int feed_hour = 0;   // feed hour inputted on keypad (0-23)
 int feed_minute = 0; // feed minute inputted on keypad (0-59)
 int seconds_until_feed = 0; // current countdown value
 bool invalid_time = false; // flag for when user enters invalid time format on keypad
+bool invalid_first_digit = false; // flag for when user enters invalid first digit for hour (must be 0, 1, or 2)
 bool time_passed = false; // flag for when current time has passed scheduled feed time  
 bool countdown_cancelled = false; // flag for when user cancels countdown by changing feed time or turning off
 bool low_food_warning = false; // flag for when user selects portion size that exceeds remaining food, triggers warning on LCD
@@ -175,6 +176,8 @@ void lcd_task(void *pvParameters)
                 hd44780_puts(&lcd_display, "Invalid time!");
             } else if (time_passed) {
                 hd44780_puts(&lcd_display, "Time passed!");
+            } else if (invalid_first_digit) {
+                hd44780_puts(&lcd_display, "Start w/ 0, 1, 2");
             } else {
                 char formatted[17]; // buffer for formatted string
                 if (digit_count <= 2) { // only hours entered so far, show as HH_
@@ -186,7 +189,6 @@ void lcd_task(void *pvParameters)
                 hd44780_puts(&lcd_display, formatted); // display formatted input on LCD
             }
         }
-
         if (executed == 3) {
             // Counting down to next feeding — show target time and remaining seconds
             hd44780_gotoxy(&lcd_display, 0, 0);
@@ -211,9 +213,8 @@ void lcd_task(void *pvParameters)
             hd44780_puts(&lcd_display, "Press REFILL btn");
         }
         vTaskDelay(DELAY_MS / portTICK_PERIOD_MS);
-    }     
-}
-
+        }     
+    }
 
 //Initialize servo motor
 static void ledc_init(void)
@@ -336,7 +337,7 @@ void app_main(void)
     t.tm_mon  = 2;      // month (0-indexed, 2 = March)
     t.tm_mday = 10;     // day of month
     t.tm_hour = 12;     // !! SET TO CURRENT HOUR (24 hrs) !!
-    t.tm_min  = 35;     // !! SET TO CURRENT MINUTE !!
+    t.tm_min  = 29;     // !! SET TO CURRENT MINUTE !!
     t.tm_sec  = 0;
     demo_time.tv_sec = mktime(&t);
     settimeofday(&demo_time, NULL);
@@ -504,6 +505,9 @@ void app_main(void)
                     // validate first digit — must be 0, 1, or 2 for a valid 24hr hour
                     if (digit_count == 0 && confirmed_key > '2') {
                         printf("Invalid first digit '%c'. Hour must start with 0, 1, or 2.\n", confirmed_key);
+                        invalid_first_digit = true;
+                        vTaskDelay(MSG_DELAY / portTICK_PERIOD_MS);
+                        invalid_first_digit = false;
                     } else {
                         keypad_buf[digit_count] = confirmed_key;    // append digit to buffer
                         digit_count++;
